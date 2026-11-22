@@ -73,6 +73,13 @@ body{
 .pchip.done{opacity:.55}
 .pchip .where{font-size:.72rem;opacity:.75;font-weight:700}
 
+#zoomCtl{
+  position:fixed;z-index:5;right:max(12px,env(safe-area-inset-right,0px));
+  bottom:calc(env(safe-area-inset-bottom,0px) + 66px);display:flex;flex-direction:column;gap:8px;
+}
+#zoomCtl .icon-btn{width:44px;height:44px}
+#zoomCtl .icon-btn:disabled{opacity:.4}
+#zoomCtl .icon-btn[aria-pressed=true]{background:var(--cream);color:var(--ink)}
 #board{
   position:fixed;z-index:6;right:max(12px,env(safe-area-inset-right,0px));
   top:calc(env(safe-area-inset-top,0px) + 58px);width:min(280px,calc(100vw - 24px));
@@ -215,6 +222,11 @@ table.sc{border-collapse:separate;border-spacing:0;width:100%;font-variant-numer
   </div>
   <div class="players" id="playersBar"></div>
 </div>
+<div id="zoomCtl" hidden>
+  <button class="icon-btn" id="zIn" aria-label="Zoom in"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></button>
+  <button class="icon-btn" id="zOut" aria-label="Zoom out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M5 12h14"/></svg></button>
+  <button class="icon-btn" id="zFit" aria-label="Show the whole hole" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg></button>
+</div>
 <div id="board" hidden></div>
 <div id="toast"></div>
 <div id="hint" hidden>Pull back to aim and set your power</div>
@@ -291,7 +303,7 @@ table.sc{border-collapse:separate;border-spacing:0;width:100%;font-variant-numer
    Constants
    ========================================================= */
 const GW = 8, GH = 11, C = 60;
-const BALL_R = 6, CUP_R = 11, MAX_STROKES = 10, STEP = 1 / 240, MAX_SPEED = 920;
+const BALL_R = 4.5, CUP_R = 9, MAX_STROKES = 10, STEP = 1 / 240, MAX_SPEED = 920;
 const DIRS = [[0,-1],[1,0],[0,1],[-1,0]];
 const COLORS = ["#ff5d73","#3fa7ff","#ffc93c","#9b6bff","#2ee6a6","#ff8a3d"];
 const PALETTES = [
@@ -705,7 +717,7 @@ let room = null, peers = [], onlineReady = false;
 let drag = null;
 
 try { const s = JSON.parse(localStorage.getItem("wonky-prefs") || "{}"); if ([3, 6, 9].includes(s.len)) len = s.len; if (s.sound === false) soundOn = false; } catch (e) {}
-const savePrefs = () => { try { localStorage.setItem("wonky-prefs", JSON.stringify({ len, sound: soundOn, name: prefs.name, color: prefs.color, local: prefs.local })); } catch (e) {} };
+const savePrefs = () => { try { localStorage.setItem("wonky-prefs", JSON.stringify({ len, sound: soundOn, zoom: userZoom, name: prefs.name, color: prefs.color, local: prefs.local })); } catch (e) {} };
 const prefs = { name: "", color: COLORS[1], local: [{ name: "Player 1", color: COLORS[0] }, { name: "Player 2", color: COLORS[1] }] };
 try { const s = JSON.parse(localStorage.getItem("wonky-prefs") || "{}"); if (typeof s.name === "string") prefs.name = s.name; if (COLORS.includes(s.color)) prefs.color = s.color; if (Array.isArray(s.local) && s.local.length >= 2) prefs.local = s.local.slice(0, 4).map((p, i) => ({ name: String(p.name || "Player " + (i + 1)).slice(0, 14), color: COLORS.includes(p.color) ? p.color : COLORS[i] })); } catch (e) {}
 
@@ -716,6 +728,7 @@ function startGame(mode, players, seed, total, code){
   loadHole(0);
   hideOverlays();
   document.getElementById("hud").hidden = false;
+  document.getElementById("zoomCtl").hidden = false;
   document.getElementById("hint").hidden = false;
   try { navigator.wakeLock && navigator.wakeLock.request("screen").catch(() => {}); } catch (e) {}
 }
@@ -726,9 +739,12 @@ function loadHole(i){
   G.balls = G.players.map((p, k) => newBall(p, k));
   G.turn = G.mode === "local" ? (G.startTurn + i) % G.players.length : 0;
   G.state = "aim";
+  G.flyAt = time + 1.1;
+  overview = false;
   particles.length = 0;
   placeOnTee(G.balls[G.turn]);
   updateHUD();
+  setTimeout(updateZoomUI, 0);
   if (G.mode === "local" && G.players.length > 1) toast(G.players[G.turn].name, "tees off first");
   else toast("Hole " + (i + 1), "Par " + G.hole.par);
   pushPresence();
@@ -1101,56 +1117,65 @@ let W = 0, Hh = 0, DPR = 1, view = { s: 1, ox: 0, oy: 0 };
 function resize(){ DPR = Math.min(window.devicePixelRatio || 1, 2.5); W = innerWidth; Hh = innerHeight; cv.width = Math.round(W * DPR); cv.height = Math.round(Hh * DPR); }
 window.addEventListener("resize", resize); resize();
 
-/* Camera: "fit" shows the whole hole; "aim" zooms out just enough that your ball sits
-   a full pull-length away from every screen edge, so maximum power is always reachable. */
-const cam = { s: 1, ox: 0, oy: 0, hole: null };
-let frameDt = 0.016;
-function fitView(h){
+/* Camera: follows your ball at your chosen zoom. While you pull back it leans toward
+   the shot and eases out with power; when you aim, it keeps a full pull of room around the ball.
+   "Whole hole" shows everything at once. */
+const cam = { s: 1, cx: 0, cy: 0, hole: null };
+let frameDt = 0.016, curAim = null, overview = false;
+let userZoom = 1;
+function layoutBox(){
   const hud = document.getElementById("hud");
   let top = 24, bottom = 30;
   if (!hud.hidden) top = hud.getBoundingClientRect().bottom + 14;
-  const titleOpen = !document.getElementById("scrTitle").hidden;
-  const pad = 26, bb = h.bbox;
-  const aw = Math.max(80, W - pad * 2), ah = Math.max(80, Hh - top - bottom - 12);
-  const s = Math.min(aw / bb.w, ah / (bb.h + 14), 2.4);
-  const ox = (W - bb.w * s) / 2 - bb.x * s;
-  const oy = titleOpen ? (Hh - bb.h * s) / 2 - bb.y * s : top + (ah - (bb.h + 14) * s) / 2 - bb.y * s;
-  return { s, ox, oy, top, bottom };
+  return { top, bottom, aw: Math.max(80, W - 52), ah: Math.max(80, Hh - top - bottom - 12) };
 }
-function aimView(h, fit, bx, by){
-  const m = maxDrag() + 12, pad = 14, bb = h.bbox, top = fit.top, bottom = fit.bottom;
-  const span = (a1, b1, a2, b2) => { const lo = Math.max(a1, a2), hi = Math.min(b1, b2); return lo <= hi ? [lo, hi] : null; };
-  let s = fit.s;
-  for (let i = 0; i < 16; i++){
-    const rx = span(pad - bb.x * s, W - pad - (bb.x + bb.w) * s, m - bx * s, W - m - bx * s);
-    const ry = span(top - bb.y * s, Hh - bottom - (bb.y + bb.h + 14) * s, top + m - by * s, Hh - bottom - m - by * s);
-    if (rx && ry){
-      const cx = (W - bb.w * s) / 2 - bb.x * s, cy = top + (Hh - top - bottom - (bb.h + 14) * s) / 2 - bb.y * s;
-      return { s, ox: clamp(cx, rx[0], rx[1]), oy: clamp(cy, ry[0], ry[1]) };
-    }
-    s *= 0.93;
-  }
-  return { s, ox: W / 2 - bx * s, oy: (top + Hh - bottom) / 2 - by * s };
+function fitScale(h, box){ return Math.min(box.aw / h.bbox.w, box.ah / (h.bbox.h + 14), 2.4); }
+function baseScale(h, box){ return Math.max(fitScale(h, box), Math.min(W, Hh) / 215); }
+function zoomLimits(h){ const box = layoutBox(), b = baseScale(h, box); return [fitScale(h, box) / b, 4.2 / b]; }
+function setZoom(z){
+  if (!G || !G.hole) return;
+  const [lo, hi] = zoomLimits(G.hole);
+  userZoom = clamp(z, lo, hi);
+  overview = false;
+  updateZoomUI(); savePrefs();
+}
+function focusBall(){
+  const b = G.balls[G.turn];
+  if (b && b.on && !b.sunk) return b;
+  return G.balls.find(o => o.on && !o.sunk) || { x: G.hole.tee.x, y: G.hole.tee.y, vx: 0, vy: 0 };
 }
 function computeView(h){
-  const fit = fitView(h);
-  let target = fit;
-  if (G && h === G.hole && G.state !== "done"){
-    const b = G.balls[G.turn];
-    if (G.state === "aim" && b.on && !b.vx && !b.vy && !b.sunk) target = aimView(h, fit, b.x, b.y);
-    else if (G.state === "rolling" && !G.camFit){
-      target = aimView(h, fit, b.lastX, b.lastY);
-      // if any moving ball nears the screen edge, pull back to the whole hole for the rest of the shot
-      for (const o of G.balls){ if (!o.on || o.sunk) continue; const sx = o.x * cam.s + cam.ox, sy = o.y * cam.s + cam.oy; if (sx < 24 || sx > W - 24 || sy < fit.top || sy > Hh - 24){ G.camFit = true; break; } }
-      if (G.camFit) target = fit;
-    } else if (G.state === "rolling") target = fit;
+  const box = layoutBox(), bb = h.bbox, fs = fitScale(h, box);
+  const titleOpen = !document.getElementById("scrTitle").hidden;
+  const midX = W / 2, midY = titleOpen ? Hh / 2 : box.top + box.ah / 2 + 6;
+  const playing = G && h === G.hole;
+  let s, fx, fy, rate = 4.5;
+  if (!playing || overview || G.state === "done" || time < (G.flyAt || 0)){
+    s = fs; fx = bb.x + bb.w / 2; fy = bb.y + bb.h / 2 + 7;
+  } else {
+    const b = focusBall();
+    s = clamp(baseScale(h, box) * userZoom, fs, 4.2);
+    let px = b.x, py = b.y;
+    if (curAim){
+      s = Math.max(fs, s * (1 - 0.22 * curAim.p));                  // ease out as power builds
+      const la = curAim.p * Math.min(box.aw, box.ah) * 0.26 / s;     // lean toward the shot
+      px += curAim.ux * la; py += curAim.uy * la; rate = 5;
+    } else if (b.vx || b.vy){ rate = 6; px += b.vx / rate; py += b.vy / rate; }  // lead a rolling ball
+    fx = bb.w * s <= box.aw - 30 ? bb.x + bb.w / 2 : clamp(px, bb.x, bb.x + bb.w);
+    fy = (bb.h + 14) * s <= box.ah - 20 ? bb.y + bb.h / 2 + 7 : clamp(py, bb.y, bb.y + bb.h);
+    if (G.state === "aim" && !drag && !b.vx && !b.vy){
+      // keep a full pull-length of screen around the ball
+      const mx = Math.min(maxDrag() * 0.8 + 16, W / 2 - 8), my = Math.min(maxDrag() * 0.8 + 16, box.ah / 2 - 8);
+      const sx = midX + (b.x - fx) * s, sy = midY + (b.y - fy) * s;
+      if (sx < mx) fx -= (mx - sx) / s; else if (sx > W - mx) fx += (sx - (W - mx)) / s;
+      if (sy < box.top + my) fy -= (box.top + my - sy) / s; else if (sy > Hh - box.bottom - my) fy += (sy - (Hh - box.bottom - my)) / s;
+    }
   }
-  if (cam.hole !== h){ cam.s = target.s; cam.ox = target.ox; cam.oy = target.oy; cam.hole = h; }
-  else if (!drag){
-    const k = 1 - Math.exp(-frameDt * 7);
-    cam.s += (target.s - cam.s) * k; cam.ox += (target.ox - cam.ox) * k; cam.oy += (target.oy - cam.oy) * k;
-  }
-  view.s = cam.s; view.ox = cam.ox; view.oy = cam.oy;
+  if (cam.hole !== h){ cam.s = fs; cam.cx = bb.x + bb.w / 2; cam.cy = bb.y + bb.h / 2 + 7; cam.hole = h; }
+  const k = 1 - Math.exp(-frameDt * rate);
+  cam.s *= Math.pow(s / cam.s, k);
+  cam.cx += (fx - cam.cx) * k; cam.cy += (fy - cam.cy) * k;
+  view.s = cam.s; view.ox = midX - cam.cx * cam.s; view.oy = midY - cam.cy * cam.s;
 }
 const toScreen = (x, y) => [x * view.s + view.ox, y * view.s + view.oy];
 const toWorld = (x, y) => [(x - view.ox) / view.s, (y - view.oy) / view.s];
@@ -1349,7 +1374,7 @@ function drawHole(h, balls, aim){
       if (!b.on || b.sunk) return;
       const sc = b.sinkT > 0 ? Math.max(0.2, 1 - b.sinkT * 0.8) : 1, r = BALL_R * sc;
       if (G && b === G.balls[G.turn] && G.state === "aim" && !b.vx && !b.vy){
-        const pr = 10 + Math.sin(time * 5) * 2;
+        const pr = 8 + Math.sin(time * 5) * 1.5;
         ctx.strokeStyle = "rgba(255,255,255,.7)"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(b.x, b.y, pr, 0, 7); ctx.stroke();
       }
       if (b.sinkT === 0){ ctx.fillStyle = "rgba(0,0,0,.28)"; ctx.beginPath(); ctx.ellipse(b.x + 1.8, b.y + 3, r, r * 0.8, 0, 0, 7); ctx.fill(); }
@@ -1439,8 +1464,8 @@ function drawAim(h, a){
     carry = (carry - sl) % 9; if (carry < 0) carry += 9;
   }
   // power ring
-  ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.arc(b.x, b.y, 15, 0, 7); ctx.stroke();
-  ctx.strokeStyle = col; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.arc(b.x, b.y, 15, -Math.PI / 2, -Math.PI / 2 + a.p * Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = "rgba(0,0,0,.25)"; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.arc(b.x, b.y, 12, 0, 7); ctx.stroke();
+  ctx.strokeStyle = col; ctx.lineWidth = 3.5; ctx.beginPath(); ctx.arc(b.x, b.y, 12, -Math.PI / 2, -Math.PI / 2 + a.p * Math.PI * 2); ctx.stroke();
 }
 function mix(a, b, t){ const pa = parseInt(a.slice(1), 16), pb = parseInt(b.slice(1), 16); const r = Math.round((pa >> 16) + ((pb >> 16) - (pa >> 16)) * t), g = Math.round((pa >> 8 & 255) + ((pb >> 8 & 255) - (pa >> 8 & 255)) * t), bl = Math.round((pa & 255) + ((pb & 255) - (pa & 255)) * t); return `rgb(${r},${g},${bl})`; }
 
@@ -1496,7 +1521,8 @@ function frame(now){
     const paused = !document.getElementById("scrMenu").hidden;
     if (!paused) simulate(dt);
     let aim = null;
-    if (drag && G.state === "aim"){ const dx = drag.x - drag.x0, dy = drag.y - drag.y0, d = Math.hypot(dx, dy); if (d > 6){ aim = { p: clamp(d / maxDrag(), 0, 1), ux: -dx / d, uy: -dy / d }; } }
+    if (drag && !pinch && G.state === "aim"){ const dx = drag.x - drag.x0, dy = drag.y - drag.y0, d = Math.hypot(dx, dy); if (d > 6){ aim = { p: clamp(d / maxDrag(), 0, 1), ux: -dx / d, uy: -dy / d }; } }
+    curAim = aim;
     drawHole(G.hole, G.balls, aim);
   } else if (demo){
     stepDemo(dt);
@@ -1506,16 +1532,28 @@ function frame(now){
 }
 const maxDrag = () => clamp(Math.min(W, Hh) * 0.3, 100, 210);
 
-/* input: pull back anywhere to aim */
+/* input: one finger pulls back to aim (anywhere on screen); two fingers pinch to zoom */
+const touches = new Map();
+let pinch = null;
+const pdist = () => { const [a, b] = [...touches.values()]; return Math.hypot(a.x - b.x, a.y - b.y) || 1; };
 cv.addEventListener("pointerdown", e => {
-  if (!G || G.state !== "aim") return;
+  touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  try { cv.setPointerCapture(e.pointerId); } catch (err) {}
+  if (!G) return;
+  if (touches.size === 2){ drag = null; pinch = { d0: pdist(), z0: userZoom }; return; }
+  if (touches.size > 2 || G.state !== "aim") return;
   const b = G.balls[G.turn]; if (b.vx || b.vy) return;
   ensureAudio();
   drag = { id: e.pointerId, x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY };
-  cv.setPointerCapture(e.pointerId);
 });
-cv.addEventListener("pointermove", e => { if (drag && e.pointerId === drag.id){ drag.x = e.clientX; drag.y = e.clientY; } });
+cv.addEventListener("pointermove", e => {
+  const t = touches.get(e.pointerId); if (t){ t.x = e.clientX; t.y = e.clientY; }
+  if (pinch && touches.size >= 2){ setZoom(pinch.z0 * pdist() / pinch.d0); return; }
+  if (drag && e.pointerId === drag.id){ drag.x = e.clientX; drag.y = e.clientY; }
+});
 const endDrag = e => {
+  touches.delete(e.pointerId);
+  if (pinch){ if (touches.size < 2) pinch = null; drag = null; return; }
   if (!drag || e.pointerId !== drag.id) return;
   const dx = drag.x - drag.x0, dy = drag.y - drag.y0, d = Math.hypot(dx, dy), p = clamp(d / maxDrag(), 0, 1);
   drag = null;
@@ -1524,6 +1562,18 @@ const endDrag = e => {
 cv.addEventListener("pointerup", endDrag);
 cv.addEventListener("pointercancel", endDrag);
 cv.addEventListener("contextmenu", e => e.preventDefault());
+cv.addEventListener("wheel", e => { if (!G) return; e.preventDefault(); setZoom(userZoom * Math.exp(-e.deltaY * 0.0015)); }, { passive: false });
+function updateZoomUI(){
+  const el = document.getElementById("zoomCtl"); if (!el || !G || !G.hole) return;
+  const [lo, hi] = zoomLimits(G.hole);
+  document.getElementById("zIn").disabled = !overview && userZoom >= hi - 1e-3;
+  document.getElementById("zOut").disabled = !overview && userZoom <= lo + 1e-3;
+  document.getElementById("zFit").setAttribute("aria-pressed", String(overview));
+}
+document.getElementById("zIn").onclick = () => setZoom((overview ? 1 : userZoom) * 1.3);
+document.getElementById("zOut").onclick = () => setZoom(userZoom / 1.3);
+document.getElementById("zFit").onclick = () => { overview = !overview; updateZoomUI(); };
+
 
 /* =========================================================
    UI
@@ -1621,7 +1671,7 @@ function showCard(final){
 function quitToTitle(){
   leaveOnline();
   G = null; drag = null; ghosts.clear();
-  $("hud").hidden = true; $("hint").hidden = true; $("board").hidden = true;
+  $("hud").hidden = true; $("hint").hidden = true; $("board").hidden = true; $("zoomCtl").hidden = true;
   newDemo(); show("scrTitle");
 }
 
@@ -1737,6 +1787,7 @@ document.addEventListener("keydown", e => { if (e.key === "Escape" && G){ if ($(
 /* =========================================================
    Boot
    ========================================================= */
+try { const z = +JSON.parse(localStorage.getItem("wonky-prefs") || "{}").zoom; if (z > 0.1 && z < 5) userZoom = z; } catch (e) {}
 renderLenSeg(); renderSound();
 newDemo();
 requestAnimationFrame(frame);
@@ -1754,7 +1805,7 @@ function start(data){
   if (data && data.seed && data.mode && Array.isArray(data.players)){
     G = { mode: data.mode, seed: data.seed, total: data.total, code: null, players: data.players.map(p => ({ name: p.name, color: p.color, card: (p.card || []).slice() })), holeIdx: 0, startTurn: data.startTurn || 0, firstShot: false };
     loadHole(Math.min(data.holeIdx || 0, data.total - 1));
-    hideOverlays(); $("hud").hidden = false;
+    hideOverlays(); $("hud").hidden = false; $("zoomCtl").hidden = false;
   }
 }
 window.claude?.hot?.ready ? window.claude.hot.ready(start) : start(window.claude?.hot?.data ?? {});
